@@ -1,0 +1,483 @@
+"""Utility functions."""
+
+import json
+import random
+import socket
+from pathlib import Path
+from typing import Any, List
+
+import mlx.core as mx
+import numpy as np
+import psutil
+import torch
+import zmq
+
+from parallax.utils.layer_types import (
+    ATTENTION,
+    DSA_ATTENTION,
+    LINEAR,
+    MLA_ATTENTION,
+    MSA_ATTENTION,
+)
+from parallax.utils.model_download import download_model_file
+
+
+def is_cuda_available():
+    """Check backend supports cuda"""
+    return torch.cuda.is_available()
+
+
+def is_mps_available():
+    """Check backend supports mps"""
+    return torch.mps.is_available()
+
+
+def is_metal_available():
+    """Check if MLX Metal backend is available"""
+    try:
+        return mx.metal.is_available()
+    except (RuntimeError, AttributeError, ImportError):
+        return False
+
+
+def get_current_device():
+    """
+    Returns the backend device name.
+    Parallax currently supports cuda, mlx, cpu
+    """
+    device = "cpu"
+    if is_cuda_available():
+        device = "cuda"
+    if is_metal_available():
+        device = "mlx"
+    return device
+
+
+def get_device_dtype(dtype_str: str, device: str):
+    """Gets the real data type according to current device"""
+    if device is not None and device.startswith("cuda"):
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+    else:
+        dtype_map = {
+            "float16": mx.float16,
+            "bfloat16": mx.bfloat16,
+            "float32": mx.float32,
+        }
+    return dtype_map[dtype_str]
+
+
+def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):
+    """Create and configure a ZeroMQ socket.
+
+    Ported from SGLang.
+    """
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    if total_mem > 32 and available_mem > 16:
+        buf_size = int(0.5 * 1024**3)
+    else:
+        buf_size = -1
+
+    socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
+
+    def set_send_opt():
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, buf_size)
+
+    def set_recv_opt():
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, buf_size)
+
+    if socket_type == zmq.PUSH:
+        set_send_opt()
+    elif socket_type == zmq.PULL:
+        set_recv_opt()
+    elif socket_type == zmq.DEALER:
+        set_send_opt()
+        set_recv_opt()
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
+
+    return socket
+
+
+def get_infinite_value_by_dtype(dtype: mx.Dtype):
+    """Returns infinite value according to mx dtype"""
+    inf = 6e4
+    if dtype in (mx.bfloat16, mx.float32):
+        inf = 1e9
+    return inf
+
+
+def pad_prefix_caches(
+    cache: List, input_lengths: List, dtype: mx.Dtype = mx.bfloat16
+) -> tuple[mx.array, mx.array]:
+    """
+    Pads prefix kv caches.
+
+    Returnas:
+        - mx.array: The padded batch of caches with a shape of [B, max_input_seq_len].
+        - mx.array: The corresponding 4D k mask with a shape of [B, 1, 1, max_output_seq_len].
+    """
+    caches_mx = [mx.array(i) if isinstance(i, np.ndarray) else i for i in cache]
+
+    seq_len_axis = 2
+    max_input_len = 0
+    max_output_len = 0
+    for i, tensor in enumerate(caches_mx):
+        max_input_len = max(max_input_len, tensor.shape[seq_len_axis])
+        max_output_len = max(max_output_len, input_lengths[i])
+
+    padded_tensors = []
+    k_masks = []
+    for i, tensor in enumerate(caches_mx):
+        cache_len = tensor.shape[seq_len_axis]
+        num_kv_padding = max_input_len - cache_len
+        input_seq_len = input_lengths[i] - 1
+        num_mask_padding = max_output_len - input_seq_len - 1
+
+        if num_kv_padding > 0:
+            pad_shape = list(tensor.shape)
+            pad_shape[seq_len_axis] = num_kv_padding
+            padding = mx.zeros(tuple(pad_shape), dtype=tensor.dtype)
+            padded_tensors.append(mx.concatenate([tensor, padding], axis=seq_len_axis))
+        else:
+            padded_tensors.append(tensor)
+
+        k_masks.append([1] * (input_seq_len + 1) + [0] * num_mask_padding)
+
+    padded_batch = mx.stack(padded_tensors, axis=0)
+    attention_mask = mx.array(k_masks, dtype=dtype)[:, None, None, :]
+    return padded_batch, attention_mask
+
+
+def pad_inputs(
+    pad_value: int, inputs: List, dtype: mx.Dtype = mx.bfloat16
+) -> tuple[mx.array, mx.array]:
+    """
+    Pads a list of sequences (token ID lists or hidden state arrays) to the same length.
+    # TODO: refactor this allow cumstomized dim.
+
+    Args:
+        pad_value: The value to use for padding. For token IDs, this should be the
+                   tokenizer's pad_token_id. For hidden states, it's ignored (always 0).
+        inputs: A list of sequences to pad. Each sequence can be a list of integers
+                or an MLX/NumPy array of hidden states.
+        dtype: The data type for the padded inputs.
+
+    Returns:
+        A tuple containing:
+        - mx.array: The padded batch of inputs.
+        - mx.array: The corresponding 4D attention mask.
+    """
+    if not inputs:
+        return mx.array([]), mx.array([])
+
+    max_len = 0
+    attention_masks = []
+
+    # Check the dimensionality of the input to handle KV cache padding
+    is_kv_cache = isinstance(inputs[0], mx.array) and inputs[0].ndim == 4
+
+    if isinstance(inputs[0], list):  # Assuming list of token IDs
+        for tokens in inputs:
+            max_len = max(max_len, len(tokens))
+
+        padded_sequences = []
+        for tokens in inputs:
+            num_padding = max_len - len(tokens)
+            padded_sequences.append(tokens + [pad_value] * num_padding)
+            attention_masks.append([1] * len(tokens) + [0] * num_padding)
+
+        padded_batch = mx.array(padded_sequences)
+
+    elif isinstance(
+        inputs[0], (mx.array, np.ndarray)
+    ):  # Assuming list of hidden states or KV caches
+        inputs_mx = [mx.array(i) if isinstance(i, np.ndarray) else i for i in inputs]
+
+        # Determine sequence length axis based on input type
+        # kv cache: (n_layers, n_kv_h, source_len, h_dim)
+        seq_len_axis = 2 if is_kv_cache else 0
+        for tensor in inputs_mx:
+            max_len = max(max_len, tensor.shape[seq_len_axis])
+
+        padded_tensors = []
+        for tensor in inputs_mx:
+            seq_len = tensor.shape[seq_len_axis]
+            num_padding = max_len - seq_len
+
+            if num_padding > 0:
+                if is_kv_cache:
+                    pad_shape = list(tensor.shape)
+                    pad_shape[seq_len_axis] = num_padding
+                    padding = mx.zeros(tuple(pad_shape), dtype=tensor.dtype)
+                else:
+                    # Hidden state shape: (seq_len, hidden_dim)
+                    hidden_dim = tensor.shape[1]
+                    padding = mx.zeros((num_padding, hidden_dim), dtype=tensor.dtype)
+                padded_tensors.append(mx.concatenate([tensor, padding], axis=seq_len_axis))
+            else:
+                padded_tensors.append(tensor)
+            attention_masks.append([1] * seq_len + [0] * num_padding)
+
+        padded_batch = mx.stack(padded_tensors, axis=0)
+
+    else:
+        raise TypeError(f"Unsupported input type for padding: {type(inputs[0])}")
+
+    # Create 4D attention mask, ensuring it's float
+    attention_mask = mx.array(attention_masks, dtype=dtype)[:, None, None, :]
+    return padded_batch, attention_mask
+
+
+def create_causal_mask(seq_len: int, total_len: int, dtype=mx.bfloat16) -> mx.array:
+    """
+    Creates a causal attention mask of shape (input_seq, total_seq).
+
+    Args:
+        input_seq: The length of sequence.
+        total_seq: The length of sequence + cached sequence.
+        dtype: The data type for the mask.
+
+    Returns:
+        mx.array: A square matrix with -1e9 on the upper triangle (excluding the diagonal).
+    """
+    assert (
+        total_len >= seq_len
+    ), f"Total lengths {total_len} should be no less than input sequence {seq_len}."
+    inf_value = get_infinite_value_by_dtype(dtype)
+    mask = mx.triu(mx.full((seq_len, seq_len), -inf_value, dtype), k=1)
+    if total_len == seq_len:
+        return mask
+    # total lengths is larger than input sequence length
+    cached_zeros = mx.zeros((seq_len, total_len - seq_len), dtype)
+    final_mask = mx.concatenate([cached_zeros, mask], axis=1)
+    return final_mask
+
+
+def combine_padding_and_causal_masks(
+    padding_mask: mx.array, causal_mask: mx.array, dtype=mx.bfloat16
+) -> mx.array:
+    """
+    Combines a padding mask and a causal mask.
+
+    Args:
+        padding_mask: A 4D padding mask of shape (B, 1, 1, total_seq)
+                      where masked positions are 0 and unmasked are 1.
+        causal_mask: A 2D causal mask of shape (input_seq, total_seq).
+        dtype: The data type for the final mask.
+
+    Returns:
+        mx.array: A combined attention mask, typically of shape (B, 1, input_seq, total_seq).
+    """
+    inf_value = get_infinite_value_by_dtype(dtype)
+    padding_mask_float = (padding_mask - 1) * inf_value
+    padding_mask_float = padding_mask_float.astype(dtype)
+    return causal_mask + padding_mask_float
+
+
+def load_config_only(name: str, local_files_only: bool = False):
+    """Load only config.json from a local path or Hugging Face repo."""
+    local_path = Path(name)
+    if local_path.exists():
+        config_file = local_path / "config.json"
+    else:
+        config_file = Path(
+            download_model_file(
+                repo_id=name,
+                filename="config.json",
+                local_files_only=local_files_only,
+            )
+        )
+
+    with open(config_file, "r") as f:
+        return normalize_model_config(json.load(f))
+
+
+def _normalize_quantization_key(key: str) -> str:
+    """Map VLM text tower quantization keys to the text-only key layout."""
+    prefixes = ("model.language_model.", "language_model.")
+    for prefix in prefixes:
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix) :]
+        if suffix.startswith("model.lm_head."):
+            return suffix.replace("model.", "", 1)
+        if suffix.startswith("model.") or suffix.startswith("lm_head."):
+            return suffix
+        return f"model.{suffix}"
+    return key
+
+
+def _normalize_quantization_config(quantization: Any) -> Any:
+    if not isinstance(quantization, dict):
+        return quantization
+
+    normalized = {}
+    for key, value in quantization.items():
+        if isinstance(value, dict):
+            normalized[_normalize_quantization_key(key)] = _normalize_quantization_config(value)
+        elif key == "ignored_layers" and isinstance(value, list):
+            normalized[key] = [
+                _normalize_quantization_key(layer) if isinstance(layer, str) else layer
+                for layer in value
+            ]
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def normalize_model_config(config: dict) -> dict:
+    """Expose nested text model fields at the top level for VLM-style configs."""
+    text_config = config.get("text_config")
+    if config.get("model_type") in {"qwen3_5", "qwen3_5_moe"} and isinstance(text_config, dict):
+        normalized = {**config, **text_config}
+        normalized["model_type"] = config["model_type"]
+        normalized["architectures"] = config.get("architectures", normalized.get("architectures"))
+        normalized["tie_word_embeddings"] = text_config.get(
+            "tie_word_embeddings", config.get("tie_word_embeddings", False)
+        )
+        return normalized
+    if config.get("model_type") == "minimax_m3_vl" and isinstance(text_config, dict):
+        normalized = {**config, **text_config}
+        normalized["model_type"] = "minimax_m3"
+        normalized["original_model_type"] = config["model_type"]
+        normalized["architectures"] = text_config.get("architectures") or [
+            "MiniMaxM3SparseForCausalLM"
+        ]
+        normalized["tie_word_embeddings"] = text_config.get(
+            "tie_word_embeddings", config.get("tie_word_embeddings", False)
+        )
+
+        sparse_config = normalized.get("sparse_attention_config")
+        if isinstance(sparse_config, dict):
+            normalized["index_head_dim"] = sparse_config.get(
+                "sparse_index_dim", normalized.get("index_head_dim")
+            )
+            # MiniMax-M3 stores a single sparse index key head; sparse_num_index_heads
+            # is the number of query heads used for block selection.
+            normalized["index_n_heads"] = normalized.get("index_n_heads", 1)
+            normalized["index_block_size"] = sparse_config.get(
+                "sparse_block_size", normalized.get("index_block_size")
+            )
+            normalized["index_topk_blocks"] = sparse_config.get(
+                "sparse_topk_blocks", normalized.get("index_topk_blocks")
+            )
+            normalized["index_local_blocks"] = sparse_config.get(
+                "sparse_local_block", normalized.get("index_local_blocks")
+            )
+
+        if (
+            normalized.get("moe_intermediate_size") is None
+            and normalized.get("intermediate_size") is not None
+        ):
+            normalized["moe_intermediate_size"] = normalized["intermediate_size"]
+
+        for quantization_key in ("quantization", "quantization_config"):
+            if quantization_key in normalized:
+                normalized[quantization_key] = _normalize_quantization_config(
+                    normalized[quantization_key]
+                )
+        if "quantization" not in normalized and "quantization_config" in normalized:
+            normalized["quantization"] = normalized["quantization_config"]
+        return normalized
+    return config
+
+
+def is_port_available(port: int):
+    """
+    Copied from SGLang.
+    Return whether a port is available.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            s.listen(1)
+            return True
+        except socket.error:
+            return False
+        except OverflowError:
+            return False
+
+
+def initialize_nccl_port():
+    """Initialize nccl port for GPU"""
+    nccl_port = random.randint(4000, 5000)
+    while True:
+        if is_port_available(nccl_port):
+            break
+        if nccl_port < 60000:
+            nccl_port += 42
+        else:
+            nccl_port -= 43
+    return nccl_port
+
+
+def _attention_cache_layer_type(config: dict) -> str:
+    model_type = config.get("model_type")
+    if model_type == "minimax_m3":
+        return MSA_ATTENTION
+
+    has_mla_cache = (
+        config.get("kv_lora_rank") is not None and config.get("qk_rope_head_dim") is not None
+    )
+    has_dsa_index = (
+        config.get("index_head_dim") is not None and config.get("index_n_heads") is not None
+    )
+    if has_mla_cache and has_dsa_index:
+        return DSA_ATTENTION
+    if has_mla_cache and model_type in {"deepseek_v3", "kimi_k2"}:
+        return MLA_ATTENTION
+    return ATTENTION
+
+
+def get_layer_types(config: dict, start_layer: int, end_layer: int) -> List[str]:
+    num_shard_layers = end_layer - start_layer
+    attention_type = _attention_cache_layer_type(config)
+
+    # Case 1: Explicit layer types (e.g., DeepSeek with layers_block_type)
+    layer_types = config.get("layers_block_type", None)
+    if layer_types is not None:
+        if len(layer_types) >= end_layer:
+            layer_types = layer_types[start_layer:end_layer]
+        return [
+            LINEAR if t in ["mamba", "linear_attention"] else attention_type for t in layer_types
+        ]
+
+    # Case 2: linear_attn_config with full_attn_layers (e.g., Kimi)
+    linear_attn_config = config.get("linear_attn_config")
+    if linear_attn_config:
+        full_attn_layers = set(linear_attn_config.get("full_attn_layers", []))
+        layer_types = []
+        for i in range(start_layer, end_layer):
+            if i in full_attn_layers:
+                layer_types.append(attention_type)
+            else:
+                layer_types.append(LINEAR)
+        return layer_types
+
+    # Case 3: full_attention_interval (e.g., Qwen3Next)
+    full_attention_interval = config.get("full_attention_interval")
+    if full_attention_interval:
+        layer_types = []
+        for i in range(start_layer, end_layer):
+            is_linear = (i + 1) % full_attention_interval != 0
+            layer_types.append(LINEAR if is_linear else attention_type)
+        return layer_types
+
+    # Default: all attention layers
+    return [attention_type] * num_shard_layers

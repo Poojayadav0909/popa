@@ -1,0 +1,175 @@
+from typing import List, Optional, Tuple
+
+import mlx.core as mx
+
+from parallax.server.cache.base import BaseCache
+
+
+class LinearCache(BaseCache):
+
+    def __init__(
+        self,
+        max_num_seqs: int = 128,
+        conv_dim: Optional[int] = None,
+        conv_kernel_size: Optional[int] = None,
+        linear_k_dim: Optional[int] = None,
+        linear_v_dim: Optional[int] = None,
+        linear_num_k_heads: Optional[int] = None,
+        linear_num_v_heads: Optional[int] = None,
+        dtype: mx.Dtype = mx.float16,
+    ):
+        self.max_num_seqs = max_num_seqs
+        self.dtype = dtype
+
+        self.conv_state_cache = None
+        self.linear_state_cache = None
+
+        if conv_dim is not None and conv_kernel_size is not None:
+            conv_state_len = conv_kernel_size - 1
+            self.conv_state_cache = mx.zeros(
+                (1, max_num_seqs, conv_state_len, conv_dim), dtype=dtype
+            )
+            mx.eval(self.conv_state_cache)
+
+        if (
+            linear_k_dim is not None
+            and linear_v_dim is not None
+            and linear_num_k_heads is not None
+            and linear_num_v_heads is not None
+        ):
+            self.linear_state_cache = mx.zeros(
+                (
+                    1,
+                    max_num_seqs,
+                    linear_num_v_heads,
+                    linear_v_dim,
+                    linear_k_dim,
+                ),
+                dtype=dtype,
+            )
+            mx.eval(self.linear_state_cache)
+
+    def get_cache(self) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+        return self.conv_state_cache, self.linear_state_cache
+
+    def get_state_cache_arrays(self) -> List[mx.array]:
+        arrays = []
+        if self.conv_state_cache is not None:
+            arrays.append(self.conv_state_cache)
+        if self.linear_state_cache is not None:
+            arrays.append(self.linear_state_cache)
+        return arrays
+
+    def get_indexer_cache(self) -> Optional[mx.array]:
+        return None
+
+    def zero_slot(self, slot_idx: int):
+        """Reset a request slot to an empty recurrent state."""
+        if self.conv_state_cache is not None:
+            self.conv_state_cache[0, slot_idx] = mx.zeros_like(self.conv_state_cache[0, slot_idx])
+        if self.linear_state_cache is not None:
+            self.linear_state_cache[0, slot_idx] = mx.zeros_like(
+                self.linear_state_cache[0, slot_idx]
+            )
+
+    def snapshot_slot(self, slot_idx: int) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+        """Copy the recurrent state currently stored in a request slot."""
+        conv_state = None
+        linear_state = None
+        arrays = []
+
+        if self.conv_state_cache is not None:
+            conv_state = self.conv_state_cache[0, slot_idx]
+            conv_state = conv_state + mx.zeros_like(conv_state)
+            arrays.append(conv_state)
+
+        if self.linear_state_cache is not None:
+            linear_state = self.linear_state_cache[0, slot_idx]
+            linear_state = linear_state + mx.zeros_like(linear_state)
+            arrays.append(linear_state)
+
+        if arrays:
+            mx.eval(*arrays)
+
+        return conv_state, linear_state
+
+    def restore_slot(
+        self,
+        slot_idx: int,
+        snapshot: Tuple[Optional[mx.array], Optional[mx.array]],
+    ):
+        """Restore a request slot from a previously captured snapshot."""
+        conv_state, linear_state = snapshot
+        if self.conv_state_cache is not None:
+            if conv_state is None:
+                self.conv_state_cache[0, slot_idx] = mx.zeros_like(
+                    self.conv_state_cache[0, slot_idx]
+                )
+            else:
+                self.conv_state_cache[0, slot_idx] = conv_state
+
+        if self.linear_state_cache is not None:
+            if linear_state is None:
+                self.linear_state_cache[0, slot_idx] = mx.zeros_like(
+                    self.linear_state_cache[0, slot_idx]
+                )
+            else:
+                self.linear_state_cache[0, slot_idx] = linear_state
+
+    def copy_slot(self, dst_slot_idx: int, src_slot_idx: int):
+        """Copy recurrent state between two slots in the shared state cache."""
+        arrays = []
+
+        if self.conv_state_cache is not None:
+            conv_state = self.conv_state_cache[0, src_slot_idx]
+            conv_state = conv_state + mx.zeros_like(conv_state)
+            self.conv_state_cache[0, dst_slot_idx] = conv_state
+            arrays.append(self.conv_state_cache)
+
+        if self.linear_state_cache is not None:
+            linear_state = self.linear_state_cache[0, src_slot_idx]
+            linear_state = linear_state + mx.zeros_like(linear_state)
+            self.linear_state_cache[0, dst_slot_idx] = linear_state
+            arrays.append(self.linear_state_cache)
+
+        if arrays:
+            mx.eval(*arrays)
+
+    def read_states(self, slot_mapping: mx.array) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+        conv_states = (
+            self.conv_state_cache[0, slot_mapping] if self.conv_state_cache is not None else None
+        )
+        linear_states = (
+            self.linear_state_cache[0, slot_mapping]
+            if self.linear_state_cache is not None
+            else None
+        )
+        return conv_states, linear_states
+
+    def write_states(
+        self,
+        slot_mapping: mx.array,
+        conv_states: Optional[mx.array],
+        linear_states: Optional[mx.array],
+    ):
+        if self.conv_state_cache is not None and conv_states is not None:
+            self.conv_state_cache[0, slot_mapping] = conv_states
+
+        if self.linear_state_cache is not None and linear_states is not None:
+            self.linear_state_cache[0, slot_mapping] = linear_states
+
+    def is_packed(self) -> bool:
+        """LinearCache doesn't use packed format."""
+        return False
+
+    def read_prefix_kv(
+        self,
+        block_table: mx.array,
+        prefix_len: int,
+        num_kv_heads: int,
+    ) -> Tuple[mx.array, mx.array]:
+        """
+        LinearCache doesn't support prefix KV reading.
+        This method should not be called for LinearCache.
+        """
+        raise NotImplementedError("LinearCache does not support prefix KV reading")
